@@ -110,17 +110,9 @@ class pfp_lcp_doc_two_pass {
         num_blocks_of_32++;
         uint16_t max_lcp_init = 0;
         
-        // create a separate block of memory for each character
-        predecessor_max_lcp = new uint16_t*[256];
-        for (size_t i = 0; i < 256; i++) {
-            predecessor_max_lcp[i] =  new uint16_t[num_blocks_of_32 * 32];
-        }
-        for (size_t i = 0; i < 256; i++)
-            for (size_t j = 0; j < num_blocks_of_32 * 32; j++)
-                predecessor_max_lcp[i][j] = max_lcp_init;
-
-        // DEBUG: START ------------------------------------------
-        // DON'T FORGET TO RELEASE THIS MEMORY
+        // maintain a table that keep track of maximum predecessor 
+        // lcp for each doc and char (small note: it ends with 2, because
+        // i replaced the old way with this new, "lazy" approach)
         predecessor_max_lcp2 = new uint16_t*[256];
         for (size_t i = 0; i < 256; i++) {
             predecessor_max_lcp2[i] =  new uint16_t[num_blocks_of_32 * 32];
@@ -129,11 +121,11 @@ class pfp_lcp_doc_two_pass {
             for (size_t j = 0; j < num_blocks_of_32 * 32; j++)
                 predecessor_max_lcp2[i][j] = max_lcp_init;
         
+        // maintain a cache to help speed updates each iteration
         last_updated_row = 256;
         dirty_lcp_cache = new uint16_t[256];
         for (size_t i = 0; i < 256; i++)
             dirty_lcp_cache[i] = max_lcp_init;
-        // DEBUG: END ---------------------------------------------
 
         // create a struct to store data for temp file
         temp_data_entry_t curr_data_entry;
@@ -244,10 +236,6 @@ class pfp_lcp_doc_two_pass {
                     // re-initialize doc profiles and max lcp with current document (itself)
                     std::fill(curr_da_profile.begin(), curr_da_profile.end(), 0);
                     curr_da_profile[doc_of_LF_i] = ref_build->total_length - pos_of_LF_i;
-
-                    // ** OLD VERSION **
-                    // update_predecessor_max_lcp_table(lcp_i, ref_build->total_length, pos_of_LF_i, doc_of_LF_i, curr_bwt_ch);
-                    // initialize_current_row_profile(doc_of_LF_i, curr_da_profile, curr_bwt_ch);
                     
                     // update the predecessor table, and initialize current document array profile
                     update_predecessor_max_lcp_table_lazy_version(lcp_i, ref_build->total_length, pos_of_LF_i, doc_of_LF_i, curr_bwt_ch);
@@ -282,14 +270,6 @@ class pfp_lcp_doc_two_pass {
             write_profile_to_temp_file(curr_da_profile);
 
         // re-initialize the predecessor table, and other structures
-        for (size_t i = 0; i < 256; i++) {
-            for (size_t j = 0; j < num_blocks_of_32 * 32; j++)
-                predecessor_max_lcp[i][j] = max_lcp_init;
-            for (size_t j = 0; j < num_docs; j++)
-                ch_doc_encountered[i][j] = false;
-        }
-
-        // DEBUG: START ------------------------------------------
         for (size_t i = 0; i < 256; i++)
             for (size_t j = 0; j < num_blocks_of_32 * 32; j++)
                 predecessor_max_lcp2[i][j] = max_lcp_init;
@@ -297,8 +277,11 @@ class pfp_lcp_doc_two_pass {
         last_updated_row = 256;
         for (size_t i = 0; i < 256; i++)
             dirty_lcp_cache[i] = max_lcp_init;
-        // DEBUG: END ---------------------------------------------
 
+        for (size_t i = 0; i < 256; i++) {
+            for (size_t j = 0; j < num_docs; j++)
+                ch_doc_encountered[i][j] = false;
+        }
 
         // perform 2nd pass which focuses only on document array profiles...
         STATUS_LOG("build_main", "performing 2nd pass to update profiles");
@@ -326,7 +309,6 @@ class pfp_lcp_doc_two_pass {
 
             // if suffix is a run boundary, update its profile if necessary
             if (is_start || is_end) {
-                //initialize_current_row_profile(doc_of_LF_i, curr_da_profile, bwt_ch);
                 initialize_current_row_profile_lazy_version(doc_of_LF_i, curr_da_profile, bwt_ch);
                 for (size_t j = 0; j < num_docs; j++) {
                     if (GET_DAP(mmap_dap_inter, (dap_ptr+j)) < curr_da_profile[j]){
@@ -340,9 +322,7 @@ class pfp_lcp_doc_two_pass {
             ch_doc_encountered[bwt_ch][doc_of_LF_i] = true;
 
             // update the predecessor table for next suffix
-            size_t lcp_i = GET_LCP(mmap_lcp_inter, (i-1));
-            
-            //update_predecessor_max_lcp_table_up(lcp_i, doc_of_LF_i, bwt_ch);
+            size_t lcp_i = GET_LCP(mmap_lcp_inter, (i-1));            
             update_predecessor_max_lcp_table_up_lazy_version(lcp_i, doc_of_LF_i, bwt_ch);
 
         }
@@ -547,8 +527,11 @@ class pfp_lcp_doc_two_pass {
 
             // deallocate memory for predecessor table
             for (size_t i = 0; i < 256; i++)
-                delete[] predecessor_max_lcp[i];
-            delete[] predecessor_max_lcp;
+                delete[] predecessor_max_lcp2[i];
+            delete[] predecessor_max_lcp2;
+
+            // deallocate memory for dirty lcp cache
+            delete[] dirty_lcp_cache;
         }
 
     }
