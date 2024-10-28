@@ -99,9 +99,11 @@ int pfpdoc_usage();
 int build_main(int argc, char** argv);
 int run_main(int argc, char** argv);
 int info_main(int argc, char** argv);
+int repstats_main(int argc, char** argv);
 int pfpdoc_build_usage();
 int pfpdoc_run_usage();
 int pfpdoc_info_usage();
+int pfpdoc_repstats_usage();
 int is_file(std::string path);
 int is_dir(std::string path);
 std::vector<std::string> split(std::string input, char delim);
@@ -208,6 +210,9 @@ struct PFPDocBuildOptions {
                 tmp_size = std::atoi(tmp_size_str.data());
                 tmp_size *= 1073741824;
 
+                if (tmp_size == 0)
+                    FATAL_ERROR("temporary memory allocated cannot be 0.");
+
                 if (use_topk)
                     FATAL_ERROR("top-k is not implemented yet with two-pass algorithm.");
             } else {
@@ -238,6 +243,31 @@ struct PFPDocBuildOptions {
             if ((use_taxcomp || use_topk) && (numcolsintable < 2 || numcolsintable > 20))
                 FATAL_ERROR("Invalid number of columns in compressed table, make sure to set it with -c, --num-col");
             
+        }
+
+        void validate_for_repstats_method() {
+            // check if filelist is a valid file
+            if (input_list.length() && !is_file(input_list)) 
+                FATAL_ERROR("The provided file-list is not valid.");
+            else if (input_list.length() == 0)
+                FATAL_ERROR("need to provide a file-list for processing.");
+            
+            // makes sure the output directory of files is valid
+            std::filesystem::path p (output_prefix);
+            if (!is_dir(p.parent_path().string()))
+                FATAL_ERROR("output path prefix is not in a valid directory.");   
+
+            // only one type of minimizer digestion can be used
+            if (use_minimizers && use_dna_minimizers)
+                FATAL_ERROR("cannot use both minimizer-alphabet and DNA-alphabet minimizers.");
+
+            // smaller window of minimizer scheme must be smaller than larger window
+            if (small_window_l > large_window_l)
+                FATAL_ERROR("small window of minimizer scheme cannot be larger than the large window.");
+
+            // make sure small window is 4 if using minimizer alphabet
+            if (use_minimizers && small_window_l != 4)
+                FATAL_ERROR("when using minimizer alphabet, the small window must be set to 4.");  
         }
 };
 
@@ -346,6 +376,7 @@ void parse_build_options(int argc, char** argv, PFPDocBuildOptions* opts);
 void parse_run_options(int argc, char** argv, PFPDocRunOptions* opts);
 void parse_info_options(int argc, char** argv, PFPDocInfoOptions* opts);
 void print_build_status_info(PFPDocBuildOptions* opts);
+void print_repstats_status_info(PFPDocBuildOptions* opts);
 void run_build_parse_cmd(PFPDocBuildOptions* build_opts, HelperPrograms* helper_bins);
 
 #endif /* End of PFP_DOC_H */

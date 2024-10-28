@@ -293,6 +293,59 @@ int info_main(int argc, char** argv) {
     return 0;
 }
 
+int repstats_main(int argc, char** argv) {
+    /* main method for the repstats command */
+    if (argc == 1) return pfpdoc_repstats_usage();
+    auto build_start = std::chrono::system_clock::now();
+
+    // grab the command-line options, and validate them (*just re-used build parsing*)
+    PFPDocBuildOptions build_opts;
+    parse_build_options(argc, argv, &build_opts);
+    build_opts.validate_for_repstats_method();
+
+    // determine output path for reference, and print all info
+    build_opts.output_ref.assign(build_opts.output_prefix + ".fna");
+    print_repstats_status_info(&build_opts);
+
+    // build the input reference file, and bitvector labeling the end for each doc
+    STATUS_LOG("cliffy::log", "building the reference file based on file-list");
+    auto start = std::chrono::system_clock::now();
+
+    ref_type database_type = DNA;
+    if (build_opts.use_minimizers) database_type = MINIMIZER;
+    else if (build_opts.use_dna_minimizers) database_type = DNA_MINIMIZER;
+
+    RefBuilder ref_build(build_opts.input_list, build_opts.output_prefix, build_opts.use_rcomp,
+                         database_type, build_opts.small_window_l, build_opts.large_window_l);
+    DONE_LOG((std::chrono::system_clock::now() - start));
+
+    // determine the paths to the BigBWT executables
+    HelperPrograms helper_bins;
+    if (!std::getenv("PFPDOC_BUILD_DIR")) {FATAL_ERROR("Need to set PFPDOC_BUILD_DIR environment variable.");}
+    helper_bins.build_paths((std::string(std::getenv("PFPDOC_BUILD_DIR")) + "/bin/").data());
+    helper_bins.validate();
+
+    // parse the input text with BigBWT
+    STATUS_LOG("cliffy::log", "generating the prefix-free parse for given reference");
+    start = std::chrono::system_clock::now();
+    run_build_parse_cmd(&build_opts, &helper_bins);
+    DONE_LOG((std::chrono::system_clock::now() - start));
+
+    // load the parse and dictionary into pf object
+    STATUS_LOG("cliffy::log", "building the parse and dictionary objects");
+    start = std::chrono::system_clock::now();
+    pf_parsing pf(build_opts.output_ref, build_opts.pfp_w);
+    DONE_LOG((std::chrono::system_clock::now() - start));
+
+    // builds the BWT, SA, LCP, and document array profiles and writes to a file
+    size_t num_runs = 0;
+    pfp_lcp_doc_two_pass lcp(pf, build_opts.output_ref, &ref_build);
+    num_runs = lcp.total_num_runs;
+    std::cerr << "\n";
+
+    return 0;
+}
+
 void run_build_parse_cmd(PFPDocBuildOptions* build_opts, HelperPrograms* helper_bins) {
     /* generates and runs the command-line for executing the PFP of the reference */
     std::ostringstream command_stream;
@@ -401,6 +454,26 @@ void print_build_status_info(PFPDocBuildOptions* opts) {
         std::fprintf(stderr, "\tUse heuristics?: %d\n\n", opts->use_heuristics);
     }
     //std::fprintf(stderr, "\tPFP window size: %d\n", opts->pfp_w);
+}
+
+void print_repstats_status_info(PFPDocBuildOptions* opts) {
+    /* prints out the information being used in the current run */
+    std::fprintf(stderr, "\nOverview of Parameters:\n");
+    std::fprintf(stderr, "\tInput file-list: %s\n", opts->input_list.data());
+    std::fprintf(stderr, "\tOutput ref path: %s\n", opts->output_ref.data());
+
+    if (opts->use_rcomp)
+        std::fprintf(stderr, "\tIncluded reverse-complement?: yes\n");
+    else
+        std::fprintf(stderr, "\tIncluded reverse-complement?: no\n");
+
+    if (opts->use_minimizers)
+        std::fprintf(stderr, "\tPerformed minimizer digestion?: yes, used minimizer-alphabet (k=%d, w=%d)\n", opts->small_window_l, opts->large_window_l);
+    else if (opts->use_dna_minimizers)
+        std::fprintf(stderr, "\tPerformed minimizer digestion?: yes, used DNA-alphabet (k=%d, w=%d)\n", opts->small_window_l, opts->large_window_l);
+    else
+        std::fprintf(stderr, "\tPerformed minimizer digestion?: no\n");
+    std::fprintf(stderr, "\n");
 }
 
 void parse_build_options(int argc, char** argv, PFPDocBuildOptions* opts) {
@@ -609,15 +682,38 @@ int pfpdoc_info_usage() {
     return 0;
 }
 
+int pfpdoc_repstats_usage() {
+    /* prints out the usage information for the build method */
+    std::fprintf(stderr, "\n%s repstats - build BWT/SA only and print out repetition stats like n/r and n/t.\n", TOOL_NAME);
+    std::fprintf(stderr, "Usage: %s repstats [options]\n\n", TOOL_NAME);
+
+    std::fprintf(stderr, "Options:\n");
+    std::fprintf(stderr, "\t%-31sprints this usage message\n", "-h, --help");
+    std::fprintf(stderr, "\t%-21s%-10spath to a file-list of genomes to use\n", "-f, --filelist", "[FILE]");
+    std::fprintf(stderr, "\t%-21s%-10soutput prefix path if using -f option\n", "-o, --output", "[PREFIX]");
+    std::fprintf(stderr, "\t%-31sinclude the reverse-complement of sequence (default: false)\n\n", "-r, --revcomp");
+
+    std::fprintf(stderr, "\t%-21s%-10sdigest the reference using minimizer-alphabet minimizers\n", "-i, --minimizers", "");
+    std::fprintf(stderr, "\t%-21s%-10sdigest the reference using DNA-alphabet minimizers\n", "-j, --dna-minimizers", "");
+    std::fprintf(stderr, "\t%-21s%-10ssize of small window used for finding minimizers (default: 4)\n", "-b, --small-window", "[INT]");
+    std::fprintf(stderr, "\t%-21s%-10ssize of large window used for finding minimizers (default: 11)\n\n", "-c, --large-window", "[INT]");
+
+    std::fprintf(stderr, "\t%-21s%-10swindow size used for pfp (default: 10)\n", "-w, --window", "[INT]");
+    std::fprintf(stderr, "\t%-21s%-10shash-modulus used for pfp (default: 100)\n\n", "-m, --modulus", "[INT]");
+
+    return 0;
+}
+
 int pfpdoc_usage() {
     /* Prints the usage information for pfp_doc */
     std::fprintf(stderr, "\n%s has different sub-commands to run:\n", TOOL_NAME);
     std::fprintf(stderr, "Usage: %s <sub-command> [options]\n\n", TOOL_NAME);
 
     std::fprintf(stderr, "Commands:\n");
-    std::fprintf(stderr, "\tbuild\tbuilds the document profile data-structure\n");
-    std::fprintf(stderr, "\trun\truns queries with respect to the document array structure\n");
-    std::fprintf(stderr, "\tinfo\tprint out information regarding this index and document array\n\n");
+    std::fprintf(stderr, "\t%-10sbuilds the document profile data-structure\n", "build");
+    std::fprintf(stderr, "\t%-10sruns queries with respect to the document array structure\n", "run");
+    std::fprintf(stderr, "\t%-10sprint out information regarding this index and document array\n", "info");
+    std::fprintf(stderr, "\t%-10sbuild BWT/SA only and print out repetition stats like n/r and n/t\n\n", "repstats");
     return 0;
 }
 
@@ -632,6 +728,8 @@ int main(int argc, char** argv) {
             return run_main(argc-1, argv+1);
         else if (std::strcmp(argv[1], "info") == 0)
             return info_main(argc-1, argv+1);
+        else if (std::strcmp(argv[1], "repstats") == 0)
+            return repstats_main(argc-1, argv+1);
     }
     return pfpdoc_usage();
 }

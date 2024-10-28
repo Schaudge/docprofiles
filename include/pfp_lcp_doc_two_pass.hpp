@@ -60,9 +60,15 @@ typedef struct
     uint8_t bwt_char = 0;
 } phrase_suffix_t;
 
+enum ConstructorType {
+    BUILD_ALL,
+    ONLY_BWT_SA_LCP
+};
+
 class pfp_lcp_doc_two_pass {
     public:
         size_t total_num_runs = 0;
+        ConstructorType constructor_type;
 
     pfp_lcp_doc_two_pass(pf_parsing &pfp_, std::string filename, RefBuilder* ref_build, 
                             std::string temp_prefix, size_t tmp_size, bool taxcomp, bool topk, 
@@ -77,9 +83,11 @@ class pfp_lcp_doc_two_pass {
                 rle(rle_),
                 tmp_file_size(tmp_size),
                 use_taxcomp(taxcomp),
-                use_topk(topk)
+                use_topk(topk),
+                constructor_type(BUILD_ALL)
     {   
         /* construction algorithm for document array profiles */
+
         STATUS_LOG("build_main", "building bwt and doc profiles based on pfp (1st-pass)");
         auto start = std::chrono::system_clock::now();
 
@@ -375,16 +383,174 @@ class pfp_lcp_doc_two_pass {
                   j, total_num_runs, total_tmp_used, (num_lcp_temp_data * TEMPDATA_RECORD), (num_dap_temp_data * DOCWIDTH)); 
     }
 
-    ~pfp_lcp_doc_two_pass() {
-        // deallocate memory for predecessor table
-        for (size_t i = 0; i < 256; i++)
-            delete[] predecessor_max_lcp[i];
-        delete[] predecessor_max_lcp;
+    pfp_lcp_doc_two_pass(pf_parsing &pfp_, std::string filename, RefBuilder* ref_build, bool rle_ = true) : 
+                pf(pfp_),
+                min_s(1, pf.n),
+                pos_s(1,0),
+                head(0),
+                num_docs(ref_build->num_docs),
+                rle(rle_),
+                constructor_type(ONLY_BWT_SA_LCP)
+    {   
+        STATUS_LOG("build_main", "building bwt, sa, and lcp based on pfp");
+        auto start = std::chrono::system_clock::now();
 
-        // unmap the temp data file
-        munmap(mmap_lcp_inter, tmp_file_size);
-        munmap(mmap_dap_inter, tmp_file_size);
-        close(dap_inter_fd); close(lcp_inter_fd);
+        initialize_index_files_for_partial_build(filename);  
+        assert(pf.dict.d[pf.dict.saD[0]] == EndOfDict);
+
+        // variables for bwt/lcp/sa construction
+        phrase_suffix_t curr;
+        phrase_suffix_t prev;
+
+        // variables for doc profile construction/tag array calculation 
+        uint8_t prev_bwt_ch = 0;
+        size_t curr_run_num = 0;
+        size_t num_tag_runs = 1;
+        size_t curr_tag_doc = 0;
+        size_t pos = 0;
+
+        // create a struct to store data for temp file
+        temp_data_entry_t curr_data_entry;
+
+        // start of construction ... this loop generates the SA, LCP and BWT
+        inc(curr);
+        while (curr.i < pf.dict.saD.size())
+        {
+            // make sure current suffix is a valid proper phrase suffix 
+            // (at least w characters but not whole phrase)
+            if(is_valid(curr))
+            {
+                // compute the next character of the BWT of T
+                std::vector<phrase_suffix_t> same_suffix(1, curr);
+                phrase_suffix_t next = curr;
+
+                // go through suffix array of dictionary and store all phrase ids with same suffix
+                while (inc(next) && (pf.dict.lcpD[next.i] >= curr.suffix_length))
+                {
+                    assert(next.suffix_length >= curr.suffix_length);
+                    assert((pf.dict.b_d[next.sn] == 0 && next.suffix_length >= pf.w) || (next.suffix_length != curr.suffix_length));
+                    if (next.suffix_length == curr.suffix_length)
+                    {
+                        same_suffix.push_back(next);
+                    }
+                }
+
+                // hard case: phrases with different BWT characters precediing them
+                int_t lcp_suffix = compute_lcp_suffix(curr, prev);
+                typedef std::pair<int_t *, std::pair<int_t *, uint8_t>> pq_t;
+
+                // using lambda to compare elements.
+                auto cmp = [](const pq_t &lhs, const pq_t &rhs) {
+                    return *lhs.first > *rhs.first;
+                };
+                
+                // merge a list of occurrences of each phrase in the BWT of the parse
+                std::priority_queue<pq_t, std::vector<pq_t>, decltype(cmp)> pq(cmp);
+                for (auto s: same_suffix)
+                {
+                    size_t begin = pf.pars.select_ilist_s(s.phrase + 1);
+                    size_t end = pf.pars.select_ilist_s(s.phrase + 2);
+                    pq.push({&pf.pars.ilist[begin], {&pf.pars.ilist[end], s.bwt_char}});
+                }
+
+                size_t prev_occ;
+                bool first = true;
+                while (!pq.empty())
+                {
+                    auto curr_occ = pq.top();
+                    pq.pop();
+
+                    if (!first)
+                    {
+                        // compute the minimum s_lcpP of the the current and previous 
+                        // occurrence of the phrase in BWT_P
+                        lcp_suffix = curr.suffix_length + min_s_lcp_T(*curr_occ.first, prev_occ);
+                    }
+                    first = false;
+
+                    // update min_s
+                    print_lcp(lcp_suffix, j);
+                    update_ssa(curr, *curr_occ.first);
+                    update_bwt(curr_occ.second.second, 1);
+                    update_esa(curr, *curr_occ.first);
+
+                    ssa = (pf.pos_T[*curr_occ.first] - curr.suffix_length) % (pf.n - pf.w + 1ULL);
+                    esa = (pf.pos_T[*curr_occ.first] - curr.suffix_length) % (pf.n - pf.w + 1ULL);
+
+                    /* Start of tag code */
+                    curr_bwt_ch = curr_occ.second.second;
+                    size_t lcp_i = lcp_suffix;
+                    size_t sa_i = ssa;
+                    size_t doc_i = ref_build->doc_ends_rank(ssa);
+
+                    // determine whether current suffix is a run boundary   
+                    bool is_start = (pos == 0 || curr_bwt_ch != prev_bwt_ch) ? 1 : 0;
+                    bool is_end = (pos == ref_build->total_length-1); // only special case, common case is below
+                    if (is_start) {curr_run_num++;}
+
+                    // keep track of when tag run changes (i.e. run of document ids)
+                    if (pos == 0)
+                        curr_tag_doc = doc_i;
+                    else if (doc_i != curr_tag_doc) {
+                        num_tag_runs++;
+                        curr_tag_doc = doc_i;
+                    }
+
+                    /* End of tag code */
+
+                    // Update prevs
+                    prev_occ = *curr_occ.first;
+                    prev_bwt_ch = curr_bwt_ch;
+
+                    // Update pq
+                    curr_occ.first++;
+                    if (curr_occ.first != curr_occ.second.first)
+                        pq.push(curr_occ);
+
+                    j += 1;
+                    pos += 1;
+                }
+                prev = same_suffix.back();
+                curr = next;
+            }
+            else {
+                inc(curr);
+            }
+        }
+        DONE_LOG((std::chrono::system_clock::now() - start));
+        std::cerr << "\n";
+
+        // print last BWT char and SA sample
+        print_sa();
+        print_bwt();
+        total_num_runs = curr_run_num;
+
+        // close output files
+        fclose(ssa_file); fclose(esa_file);
+        fclose(bwt_file);
+        fclose(bwt_file_len);
+        fclose(lcp_file);
+
+        // print out statistics
+        double n_over_r = (pos + 0.0)/total_num_runs;
+        double n_over_t = (pos + 0.0)/num_tag_runs;
+        STATS_LOG("build_main", "stats: n = %ld, r = %ld, t = %ld, n/r = %.3f, n/t = %.3f", 
+                   pos, total_num_runs, num_tag_runs, n_over_r, n_over_t); 
+    }
+
+    ~pfp_lcp_doc_two_pass() {
+        if (constructor_type == BUILD_ALL) {
+            // unmap the temp data file
+            munmap(mmap_lcp_inter, tmp_file_size);
+            munmap(mmap_dap_inter, tmp_file_size);
+            close(dap_inter_fd); close(lcp_inter_fd);
+
+            // deallocate memory for predecessor table
+            for (size_t i = 0; i < 256; i++)
+                delete[] predecessor_max_lcp[i];
+            delete[] predecessor_max_lcp;
+        }
+
     }
 
     private:
@@ -589,6 +755,40 @@ class pfp_lcp_doc_two_pass {
                                          MAP_SHARED, 
                                          dap_inter_fd, 0);
             assert(mmap_dap_inter != MAP_FAILED);
+        }
+
+        void initialize_index_files_for_partial_build(std::string filename) {
+            /* opening output files for data-structures like  LCP, SA, BWT */
+
+            // LCP data-structure
+            std::string outfile = filename + std::string(".lcp");
+            if ((lcp_file = fopen(outfile.c_str(), "w")) == nullptr)
+                error("open() file " + outfile + " failed");
+            
+            // Suffix array samples at start of runs
+            outfile = filename + std::string(".ssa");
+            if ((ssa_file = fopen(outfile.c_str(), "w")) == nullptr)
+                error("open() file " + outfile + " failed");
+            
+            // Suffix array samples at end of runs
+            outfile = filename + std::string(".esa");
+            if ((esa_file = fopen(outfile.c_str(), "w")) == nullptr)
+                error("open() file " + outfile + " failed");
+            
+            // BWT index files
+            if (rle) {
+                outfile = filename + std::string(".bwt.heads");
+                if ((bwt_file = fopen(outfile.c_str(), "w")) == nullptr)
+                    error("open() file " + outfile + " failed");
+
+                outfile = filename + std::string(".bwt.len");
+                if ((bwt_file_len = fopen(outfile.c_str(), "w")) == nullptr)
+                    error("open() file " + outfile + " failed");
+            } else {
+                outfile = filename + std::string(".bwt");
+                if ((bwt_file = fopen(outfile.c_str(), "w")) == nullptr)
+                    error("open() file " + outfile + " failed");
+            }   
         }
 
         void initialize_tmp_size_variables() {
